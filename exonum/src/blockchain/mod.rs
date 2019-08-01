@@ -67,7 +67,7 @@ mod genesis;
 mod schema;
 mod service;
 #[macro_use]
-mod transaction;
+pub mod transaction;
 #[cfg(test)]
 mod tests;
 
