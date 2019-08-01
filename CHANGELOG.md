@@ -15,7 +15,7 @@ The project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 - Trait `BinaryForm` has been replaced by `BinaryValue`. (#1298)
 
   To implement `BinaryValue` for types that implements `Protobuf::Message` use
-  `impl_binary_value_for_message` macros from `exonum-merkledb` crate.
+  `impl_binary_value_for_pb_message` macros.
 
 - Module `storage` has been replaced by `exonum-merkledb` crate. See related section
   in changelog for details. (#1293)
@@ -58,11 +58,13 @@ The project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
   An additional field in the response of the endpoint was added. The field
   corresponds to the total number of transactions in the blockchain. (#1289)
 
-- `system/v1/mempool` endpoint has been renamed into `system/v1/stats`.
-  An additional field in the response of the endpoint was added. The field
-  corresponds to the total number of transactions in the blockchain. (#1289)
-
 #### exonum-merkledb
+
+- Added restrictions to index names. Allowable characters in index name: ASCII
+  characters, digits, underscores and dashes. (#1388)
+
+- Added `Debug` implementation for `Database`, `Snapshot`, `Iterator` dynamic
+  traits (#1363)
 
 - Changed storage layout (#1293)
 
@@ -110,6 +112,19 @@ The project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
   - **bytes** - non-null bytes of the given `ProofPath`, i.e. the first
     `(bits_len + 7) / 8` bytes.
 
+### New features
+
+#### exonum
+
+- New endpoint: `v1/transactions/subscribe`, which subscribe to new transaction events.
+  This endpoint accept optional parameters: `service_id` and `message_id`
+  (`message_id` as in derive macro `TransactionSet`). (#1335)
+
+- New endpoint: `v1/ws`, which open websocket connection and allow to set multiple
+  subscription (for blocks and transaction, filtered by service and transaction id)
+  and send transactions (in hex, like in explorer) to blockchain
+  (examples can be found in related pull request). (#1335)
+
 ### Bug Fixes
 
 #### exonum-testkit
@@ -138,6 +153,11 @@ The project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 - Added a new endpoint `system/v1/services` for displaying information
   about available services. (#1288)
 
+- A channel for api requests has been changed to unbounded. (#1308)
+
+- Endpoints `explorer/v1/block` and `explorer/v1/transactions` were extended
+  with adding additional fields `service_id` and `time`. (#1386)
+
 #### exonum-merkledb
 
 - Updated `ProofMapIndex` data layout. (#1293)
@@ -154,10 +174,12 @@ The project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 
   - `get_object_existed` and `get_object_existed_mut` methods of `Fork` and `Snapshot`
     returns optional references to index.
+
 - `rocksdb` crate is now used instead of `exonum_rocksdb`. (#1286)
 
-- Added a new endpoint `system/v1/services` for displaying information
-  about available services. (#1288)
+- Added `len` method to `MapIndex` and `ProofMapIndex`. (#1312)
+
+- Added `len` method to `KeySetIndex` and `ValueSetIndex`. (#1319)
 
 #### exonum-testkit
 
@@ -534,6 +556,7 @@ The project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
   - Remove old dependencies on `iron` and its companions `bodyparser`, `router`
     and others.
   - Simplify the API handlers as follows:
+
     ```rust
     fn my_handler(state: &ServiceApiState, query: MyQueryType)
     -> Result<MyResponse, ApiError>
@@ -541,6 +564,7 @@ The project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
       // ...
     }
     ```
+
     where `MyQueryType` type implements `Deserialize` trait and `MyResponse`
     implements `Serialize` trait.
   - Replace old methods `public_api_handler` and `private_api_handler` of

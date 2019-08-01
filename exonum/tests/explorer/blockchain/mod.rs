@@ -16,8 +16,6 @@
 
 use futures::sync::mpsc;
 
-use std::borrow::Cow;
-
 use exonum::{
     blockchain::{
         Blockchain, ExecutionError, ExecutionResult, Schema, Service, Transaction,
@@ -127,7 +125,7 @@ pub fn create_blockchain() -> Blockchain {
     let (consensus_key, _) = consensus_keys();
     let service_keys = crypto::gen_keypair();
 
-    let api_channel = mpsc::channel(10);
+    let api_channel = mpsc::unbounded();
     let mut blockchain = Blockchain::new(
         TemporaryDB::new(),
         vec![MyService.into()],

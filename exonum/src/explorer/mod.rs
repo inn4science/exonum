@@ -34,7 +34,9 @@ use crate::blockchain::{
 use crate::crypto::{CryptoHash, Hash};
 use crate::helpers::Height;
 use crate::messages::{Precommit, RawTransaction, Signed};
+use chrono::{DateTime, Utc};
 use exonum_merkledb::{ListProof, Snapshot};
+use std::time::UNIX_EPOCH;
 
 /// Transaction parsing result.
 type ParseResult = Result<TransactionMessage, failure::Error>;
@@ -384,11 +386,13 @@ impl<'a> IntoIterator for &'a BlockWithTransactions {
 ///     "content": {
 ///         "message": //...
 /// #                    message,
+///         "service_id": 0
 ///     },
 ///     "location": { "block_height": 1, "position_in_block": 0 },
 ///     "location_proof": // ...
 /// #                     { "val": Hash::zero() },
-///     "status": { "type": "success" }
+///     "status": { "type": "success" },
+///     "time": "2019-07-16T15:26:43.502696Z"
 /// });
 ///
 /// let parsed: CommittedTransaction =
@@ -403,19 +407,20 @@ pub struct CommittedTransaction {
     location_proof: ListProof<Hash>,
     #[serde(with = "TxStatus")]
     status: TransactionResult,
+    time: DateTime<Utc>,
 }
 
 /// Transaction execution status. Simplified version of `TransactionResult`.
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[derive(Debug, Serialize, Deserialize)]
-enum TxStatus<'a> {
+pub(crate) enum TxStatus<'a> {
     Success,
     Panic { description: &'a str },
     Error { code: u8, description: &'a str },
 }
 
 impl<'a> TxStatus<'a> {
-    fn serialize<S>(result: &TransactionResult, serializer: S) -> Result<S::Ok, S::Error>
+    pub(crate) fn serialize<S>(result: &TransactionResult, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -423,7 +428,7 @@ impl<'a> TxStatus<'a> {
         status.serialize(serializer)
     }
 
-    fn deserialize<D>(deserializer: D) -> Result<TransactionResult, D::Error>
+    pub(crate) fn deserialize<D>(deserializer: D) -> Result<TransactionResult, D::Error>
     where
         D: Deserializer<'a>,
     {
@@ -488,6 +493,11 @@ impl CommittedTransaction {
     /// Returns the status of the transaction execution.
     pub fn status(&self) -> Result<(), &TransactionError> {
         self.status.0.as_ref().map(|_| ())
+    }
+
+    /// Returns a commit time of the block which includes this transaction.
+    pub fn time(&self) -> &DateTime<Utc> {
+        &self.time
     }
 }
 
@@ -559,7 +569,8 @@ impl CommittedTransaction {
 ///     "type": "in-pool",
 ///     "content": {
 ///         "message": // ...
-/// #                    message
+/// #                    message,
+///         "service_id": 0
 ///     }
 /// });
 ///
@@ -651,11 +662,11 @@ impl<'a> BlockchainExplorer<'a> {
         let schema = Schema::new(&self.snapshot);
         let content = self.transaction_without_proof(tx_hash)?;
         if schema.transactions_pool().contains(tx_hash) {
-            return Some(TransactionInfo::InPool { content });
+            Some(TransactionInfo::InPool { content })
+        } else {
+            let tx = self.committed_transaction(tx_hash, Some(content));
+            Some(TransactionInfo::Committed(tx))
         }
-
-        let tx = self.committed_transaction(tx_hash, Some(content));
-        Some(TransactionInfo::Committed(tx))
     }
 
     /// Returns transaction message without proof.
@@ -705,6 +716,11 @@ impl<'a> BlockchainExplorer<'a> {
             .block_transactions(location.block_height())
             .get_proof(location.position_in_block());
 
+        let block_precommits = schema
+            .block_and_precommits(location.block_height())
+            .unwrap();
+        let time = median_precommits_time(&block_precommits.precommits);
+
         // Unwrap is OK here, because we already know that transaction is committed.
         let status = schema.transaction_results().get(tx_hash).unwrap();
 
@@ -717,6 +733,7 @@ impl<'a> BlockchainExplorer<'a> {
             location,
             location_proof,
             status,
+            time,
         }
     }
 
@@ -832,5 +849,16 @@ impl<'a> DoubleEndedIterator for Blocks<'a> {
 
         self.back = self.back.previous();
         Some(BlockInfo::new(self.explorer, self.back))
+    }
+}
+
+/// Calculates a median time from precommits.
+pub fn median_precommits_time(precommits: &[Signed<Precommit>]) -> DateTime<Utc> {
+    if precommits.is_empty() {
+        UNIX_EPOCH.into()
+    } else {
+        let mut times: Vec<_> = precommits.iter().map(|p| p.time()).collect();
+        times.sort();
+        times[times.len() / 2]
     }
 }

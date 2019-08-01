@@ -21,6 +21,7 @@ use std::{
         Bound::{Included, Unbounded},
         HashMap,
     },
+    fmt,
     iter::{FromIterator, Iterator as StdIterator, Peekable},
     mem,
     ops::{Deref, DerefMut},
@@ -203,6 +204,10 @@ impl WorkingPatch {
     }
 
     /// Returns a mutable reference to the changes corresponding to a certain index.
+    ///
+    /// # Panics
+    ///
+    /// If an index with the `address` already exists in `Fork` that uses this patch.
     pub fn changes_mut(&self, address: &IndexAddress) -> ChangesRef {
         let view_changes = {
             let mut changes = self.changes.borrow_mut();
@@ -370,9 +375,9 @@ pub enum Change {
 /// need to consistently apply several sets of changes to the same data, the next fork should be
 /// created after the previous fork has been merged.
 ///
-/// `Fork` also supports checkpoints ([`checkpoint`], [`commit`] and
+/// `Fork` also supports checkpoints ([`flush`] and
 /// [`rollback`] methods), which allows rolling back some of the latest changes (e.g., after
-/// a runtime error).
+/// a runtime error). Checkpoint is created automatically after calling the `flush` method.
 ///
 /// `Fork` implements the [`Snapshot`] trait and provides methods for both reading and
 /// writing data. Thus, `&mut Fork` is used as a storage view for creating
@@ -381,6 +386,22 @@ pub enum Change {
 /// **Note.** Unless stated otherwise, "key" in the method descriptions below refers
 /// to a full key (a string column family name + key as an array of bytes within the family).
 ///
+/// **Note.** It is possible to create only one instance of index with the specified name based on a
+/// single fork. This restriction is due to impossibility to obtain multiple mutable references to
+/// the same change set inside the fork.
+///
+/// For example the code below will panic at runtime.
+///
+/// ```rust, no_run
+/// use exonum_merkledb::{TemporaryDB, ListIndex, Database};
+/// let db = TemporaryDB::new();
+/// let fork = db.fork();
+///
+/// let index1: ListIndex<_, u8> = ListIndex::new("index", &fork);
+/// // This code will panic at runtime.
+/// let index2: ListIndex<_, u8> = ListIndex::new("index", &fork);
+/// ```
+///
 /// [`Snapshot`]: trait.Snapshot.html
 /// [`put`]: #method.put
 /// [`remove`]: #method.remove
@@ -388,14 +409,15 @@ pub enum Change {
 /// [`Patch`]: struct.Patch.html
 /// [`into_patch`]: #method.into_patch
 /// [`merge`]: trait.Database.html#tymethod.merge
-/// [`checkpoint`]: #method.checkpoint
 /// [`commit`]: #method.commit
 /// [`rollback`]: #method.rollback
+#[derive(Debug)]
 pub struct Fork {
     flushed: FlushedFork,
     working_patch: WorkingPatch,
 }
 
+#[derive(Debug)]
 pub struct FlushedFork {
     snapshot: Box<dyn Snapshot>,
     patch: Patch,
@@ -565,23 +587,16 @@ impl Snapshot for FlushedFork {
 }
 
 impl Fork {
-    /// Finalizes all changes after the latest checkpoint.
-    ///
-    /// # Panics
-    ///
-    /// Panics if there is no active checkpoint, or the latest checkpoint
-    /// is already committed or rolled back.
+    /// Finalizes all changes that were made after previous execution of the `flush` method.
+    /// If no `flush` method had been called before, finalizes all changes that were
+    /// made after creation of `Fork`.
     pub fn flush(&mut self) {
         let working_patch = mem::replace(&mut self.working_patch, WorkingPatch::new());
         working_patch.merge_into(&mut self.flushed.patch);
     }
 
-    /// Rolls back all changes after the latest checkpoint.
-    ///
-    /// # Panics
-    ///
-    /// Panics if there is no active checkpoint, or the latest checkpoint
-    /// is already committed or rolled back.
+    /// Rolls back all changes that were made after the latest execution
+    /// of the `flush` method.
     pub fn rollback(&mut self) {
         self.working_patch = WorkingPatch::new();
     }
@@ -599,8 +614,7 @@ impl Fork {
     ///
     /// # Panics
     ///
-    /// Panics if a checkpoint has been created before and has not been committed
-    /// or rolled back yet.
+    /// Panics if a target `Fork` contains unflushed changes.
     pub fn merge(&mut self, patch: Patch) {
         assert!(!self.is_dirty(), "cannot merge a dirty fork");
 
@@ -648,12 +662,6 @@ impl AsRef<dyn Snapshot> for Fork {
 impl AsRef<dyn Snapshot> for dyn Snapshot + 'static {
     fn as_ref(&self) -> &dyn Snapshot {
         self
-    }
-}
-
-impl ::std::fmt::Debug for Fork {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-        write!(f, "Fork(..)")
     }
 }
 
@@ -774,10 +782,21 @@ where
     }
 }
 
-#[cfg_attr(feature = "cargo-clippy", allow(clippy::use_self))]
-impl<T: Database> From<T> for Box<dyn Database> {
-    fn from(db: T) -> Self {
-        Box::new(db) as Self
+impl fmt::Debug for dyn Database {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Database").finish()
+    }
+}
+
+impl fmt::Debug for dyn Snapshot {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Snapshot").finish()
+    }
+}
+
+impl fmt::Debug for dyn Iterator {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Iterator").finish()
     }
 }
 

@@ -12,22 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use snow::error::Error;
+// For rust-protobuf generated files.
+#![allow(bare_trait_objects)]
+#![allow(renamed_and_removed_lints)]
 
-#[derive(Fail, Debug)]
-pub enum NoiseError {
-    #[fail(display = "Wrong handshake message length {}", _0)]
-    WrongMessageLength(usize),
+pub use self::tests_transactions::{CreateWallet, Transfer};
 
-    #[fail(display = "{}", _0)]
-    Other(String),
+include!(concat!(env!("OUT_DIR"), "/exonum_tests_proto_mod.rs"));
 
-    #[fail(display = "Snow error: {}", _0)]
-    Snow(Error),
-}
-
-impl From<Error> for NoiseError {
-    fn from(err: Error) -> NoiseError {
-        NoiseError::Snow(err)
-    }
-}
+use exonum::proto::schema::*;

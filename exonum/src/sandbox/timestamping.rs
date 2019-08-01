@@ -14,18 +14,14 @@
 
 pub use crate::proto::schema::tests::TimestampTx;
 
-use rand::{RngCore, SeedableRng};
-use rand_xorshift::XorShiftRng;
-
-use std::borrow::Cow;
+use rand::{rngs::ThreadRng, thread_rng, RngCore};
 
 use crate::blockchain::{
     ExecutionResult, Service, Transaction, TransactionContext, TransactionSet,
 };
 use crate::crypto::{gen_keypair, Hash, PublicKey, SecretKey, HASH_SIZE};
 use crate::messages::{Message, RawTransaction, Signed};
-use exonum_merkledb::{impl_binary_value_for_message, BinaryValue, Snapshot};
-use protobuf::Message as PbMessage;
+use exonum_merkledb::{BinaryValue, Snapshot};
 
 pub const TIMESTAMPING_SERVICE: u16 = 129;
 pub const DATA_SIZE: usize = 64;
@@ -42,13 +38,13 @@ impl Transaction for TimestampTx {
     }
 }
 
-impl_binary_value_for_message! { TimestampTx }
+impl_binary_value_for_pb_message! { TimestampTx }
 
 #[derive(Default)]
 pub struct TimestampingService {}
 
 pub struct TimestampingTxGenerator {
-    rand: XorShiftRng,
+    rand: ThreadRng,
     data_size: usize,
     public_key: PublicKey,
     secret_key: SecretKey,
@@ -64,7 +60,7 @@ impl TimestampingTxGenerator {
         data_size: usize,
         keypair: (PublicKey, SecretKey),
     ) -> TimestampingTxGenerator {
-        let rand = XorShiftRng::from_seed([9; 16]);
+        let rand = thread_rng();
 
         TimestampingTxGenerator {
             rand,
@@ -99,12 +95,12 @@ impl TimestampingService {
 }
 
 impl Service for TimestampingService {
-    fn service_name(&self) -> &str {
-        "sandbox_timestamping"
-    }
-
     fn service_id(&self) -> u16 {
         TIMESTAMPING_SERVICE
+    }
+
+    fn service_name(&self) -> &str {
+        "sandbox_timestamping"
     }
 
     fn state_hash(&self, _: &dyn Snapshot) -> Vec<Hash> {

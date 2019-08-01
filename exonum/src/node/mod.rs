@@ -26,7 +26,7 @@ pub use self::{
 pub mod state;
 
 use failure::Error;
-use futures::{sync::mpsc, Future, Sink};
+use futures::{sync::mpsc, Sink};
 use tokio_core::reactor::Core;
 use tokio_threadpool::Builder as ThreadPoolBuilder;
 use toml::Value;
@@ -53,7 +53,7 @@ use crate::events::{
     error::{into_failure, LogError},
     noise::HandshakeParams,
     HandlerPart, InternalEvent, InternalPart, InternalRequest, NetworkConfiguration, NetworkEvent,
-    NetworkPart, NetworkRequest, SyncSender, TimeoutRequest,
+    NetworkPart, NetworkRequest, SyncSender, TimeoutRequest, UnboundedSyncSender,
 };
 use crate::helpers::{
     config::ConfigManager,
@@ -113,7 +113,7 @@ pub trait SystemStateProvider: ::std::fmt::Debug + Send + 'static {
 
 /// Transactions sender.
 #[derive(Clone)]
-pub struct ApiSender(pub mpsc::Sender<ExternalMessage>);
+pub struct ApiSender(pub mpsc::UnboundedSender<ExternalMessage>);
 
 /// Handler that that performs consensus algorithm.
 pub struct NodeHandler {
@@ -314,6 +314,38 @@ impl NodeConfig<PathBuf> {
     }
 }
 
+impl<T> NodeConfig<T> {
+    fn validate_or_panic(&self) {
+        let capacity = &self.mempool.events_pool_capacity;
+        if capacity.internal_events_capacity < 3 {
+            panic!(
+                "internal_events_capacity({}) must be strictly larger than 2",
+                capacity.internal_events_capacity
+            );
+        }
+        if capacity.network_requests_capacity == 0 {
+            panic!(
+                "network_requests_capacity({}) must be strictly larger than 0",
+                capacity.network_requests_capacity
+            );
+        }
+        // Sanity checks for cases of accidental negative overflows.
+        let sanity_max = 2_usize.pow(16);
+        if capacity.internal_events_capacity >= sanity_max {
+            panic!(
+                "internal_events_capacity({}) must be smaller than {}",
+                capacity.internal_events_capacity, sanity_max,
+            );
+        }
+        if capacity.network_requests_capacity >= sanity_max {
+            panic!(
+                "network_requests_capacity({}) must be smaller than {}",
+                capacity.network_requests_capacity, sanity_max,
+            );
+        }
+    }
+}
+
 /// Configuration for the `NodeHandler`.
 #[derive(Debug, Clone)]
 pub struct Configuration {
@@ -337,7 +369,7 @@ pub struct NodeSender {
     /// Network requests sender.
     pub network_requests: SyncSender<NetworkRequest>,
     /// Api requests sender.
-    pub api_requests: SyncSender<ExternalMessage>,
+    pub api_requests: UnboundedSyncSender<ExternalMessage>,
 }
 
 /// Node role.
@@ -772,7 +804,7 @@ impl fmt::Debug for NodeHandler {
 
 impl ApiSender {
     /// Creates new `ApiSender` with given channel.
-    pub fn new(inner: mpsc::Sender<ExternalMessage>) -> Self {
+    pub fn new(inner: mpsc::UnboundedSender<ExternalMessage>) -> Self {
         ApiSender(inner)
     }
 
@@ -786,11 +818,11 @@ impl ApiSender {
     pub fn send_external_message(&self, message: ExternalMessage) -> Result<(), Error> {
         self.0
             .clone()
-            .send(message)
-            .wait()
+            .unbounded_send(message)
             .map(drop)
             .map_err(into_failure)
     }
+
     /// Broadcast transaction to other node.
     pub fn broadcast_transaction(&self, tx: Signed<RawTransaction>) -> Result<(), Error> {
         let msg = ExternalMessage::Transaction(tx);
@@ -845,8 +877,8 @@ pub struct NodeChannel {
     ),
     /// Channel for api requests.
     pub api_requests: (
-        mpsc::Sender<ExternalMessage>,
-        mpsc::Receiver<ExternalMessage>,
+        mpsc::UnboundedSender<ExternalMessage>,
+        mpsc::UnboundedReceiver<ExternalMessage>,
     ),
     /// Channel for network events.
     pub network_events: (mpsc::Sender<NetworkEvent>, mpsc::Receiver<NetworkEvent>),
@@ -871,7 +903,7 @@ impl NodeChannel {
         Self {
             network_requests: mpsc::channel(buffer_sizes.network_requests_capacity),
             internal_requests: mpsc::channel(buffer_sizes.internal_events_capacity),
-            api_requests: mpsc::channel(buffer_sizes.api_requests_capacity),
+            api_requests: mpsc::unbounded(), // TODO ECR-3163
             network_events: mpsc::channel(buffer_sizes.network_events_capacity),
             internal_events: mpsc::channel(buffer_sizes.internal_events_capacity),
         }
@@ -896,6 +928,8 @@ impl Node {
         config_file_path: Option<String>,
     ) -> Self {
         crypto::init();
+
+        node_cfg.validate_or_panic();
 
         let channel = NodeChannel::new(&node_cfg.mempool.events_pool_capacity);
         let mut blockchain = Blockchain::new(
@@ -988,6 +1022,7 @@ impl Node {
     /// Private api prefix is `/api/services/{service_name}`
     pub fn run(self) -> Result<(), failure::Error> {
         trace!("Running node.");
+        let api_state = self.handler.api_state.clone();
         // Runs actix-web api.
         let actix_api_runtime = SystemRuntimeConfig {
             api_runtimes: {
@@ -1046,6 +1081,9 @@ impl Node {
             self.max_message_len,
         );
         self.run_handler(&handshake_params)?;
+
+        // Stop ws server.
+        api_state.shutdown_broadcast_server();
 
         // Stops actix web runtime.
         actix_api_runtime.stop()?;
@@ -1107,8 +1145,6 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
-
     use super::*;
     use crate::blockchain::{
         ExecutionResult, Schema, Service, Transaction, TransactionContext, TransactionSet,
@@ -1117,10 +1153,7 @@ mod tests {
     use crate::events::EventHandler;
     use crate::helpers;
     use crate::proto::{schema::tests::TxSimple, ProtobufConvert};
-    use exonum_merkledb::{
-        impl_binary_value_for_message, BinaryValue, Database, Snapshot, TemporaryDB,
-    };
-    use protobuf::Message as ProtobufMessage;
+    use exonum_merkledb::{BinaryValue, Database, Snapshot, TemporaryDB};
 
     const SERVICE_ID: u16 = 0;
 
@@ -1130,7 +1163,7 @@ mod tests {
         TxSimple(TxSimple),
     }
 
-    impl_binary_value_for_message! { TxSimple }
+    impl_binary_value_for_pb_message! { TxSimple }
 
     impl Transaction for TxSimple {
         fn execute(&self, _: TransactionContext) -> ExecutionResult {
@@ -1218,5 +1251,59 @@ mod tests {
         let snapshot = node.blockchain().snapshot();
         let schema = Schema::new(&snapshot);
         assert_eq!(schema.transactions_pool_len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "internal_events_capacity(0) must be strictly larger than 2")]
+    fn test_bad_internal_events_capacity_too_small() {
+        let db = Arc::from(Box::new(TemporaryDB::new()) as Box<dyn Database>) as Arc<dyn Database>;
+        let services = vec![];
+        let mut node_cfg = helpers::generate_testnet_config(1, 16_500)[0].clone();
+        node_cfg
+            .mempool
+            .events_pool_capacity
+            .internal_events_capacity = 0;
+        let _ = Node::new(db, services, node_cfg, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "network_requests_capacity(0) must be strictly larger than 0")]
+    fn test_bad_network_requests_capacity_too_small() {
+        let db = Arc::from(Box::new(TemporaryDB::new()) as Box<dyn Database>) as Arc<dyn Database>;
+        let services = vec![];
+        let mut node_cfg = helpers::generate_testnet_config(1, 16_500)[0].clone();
+        node_cfg
+            .mempool
+            .events_pool_capacity
+            .network_requests_capacity = 0;
+        let _ = Node::new(db, services, node_cfg, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be smaller than 65536")]
+    fn test_bad_internal_events_capacity_too_large() {
+        let accidental_large_value = 0_usize.overflowing_sub(1).0;
+        let db = Arc::from(Box::new(TemporaryDB::new()) as Box<dyn Database>) as Arc<dyn Database>;
+        let services = vec![];
+        let mut node_cfg = helpers::generate_testnet_config(1, 16_500)[0].clone();
+        node_cfg
+            .mempool
+            .events_pool_capacity
+            .internal_events_capacity = accidental_large_value;
+        let _ = Node::new(db, services, node_cfg, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be smaller than 65536")]
+    fn test_bad_network_requests_capacity_too_large() {
+        let accidental_large_value = 0_usize.overflowing_sub(1).0;
+        let db = Arc::from(Box::new(TemporaryDB::new()) as Box<dyn Database>) as Arc<dyn Database>;
+        let services = vec![];
+        let mut node_cfg = helpers::generate_testnet_config(1, 16_500)[0].clone();
+        node_cfg
+            .mempool
+            .events_pool_capacity
+            .network_requests_capacity = accidental_large_value;
+        let _ = Node::new(db, services, node_cfg, None);
     }
 }

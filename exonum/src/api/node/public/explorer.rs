@@ -15,25 +15,24 @@
 //! Exonum blockchain explorer API.
 
 use actix::Arbiter;
-use actix_web::{http, ws};
+use actix_web::{http, ws, AsyncResponder, Error as ActixError, FromRequest, Query};
 use chrono::{DateTime, Utc};
-use futures::IntoFuture;
+use futures::{Future, IntoFuture};
 
 use std::ops::{Bound, Range};
 use std::sync::{Arc, Mutex};
-use std::time::UNIX_EPOCH;
 
 use crate::{
     api::{
         backends::actix::{
             self as actix_backend, FutureResponse, HttpRequest, RawHandler, RequestHandler,
         },
-        websocket::{Server, Session},
+        websocket::{Server, Session, SubscriptionType, TransactionFilter},
         Error as ApiError, ServiceApiBackend, ServiceApiScope, ServiceApiState,
     },
     blockchain::{Block, SharedNodeState},
     crypto::Hash,
-    explorer::{self, BlockchainExplorer, TransactionInfo},
+    explorer::{self, median_precommits_time, BlockchainExplorer, TransactionInfo},
     helpers::Height,
     messages::{Message, Precommit, RawTransaction, Signed, SignedMessage},
 };
@@ -51,6 +50,13 @@ pub struct BlocksRange {
     pub blocks: Vec<BlockInfo>,
 }
 
+/// Information about a transaction included in the block.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct TxInfo {
+    tx_hash: Hash,
+    service_id: u16,
+}
+
 /// Information about a block in the blockchain.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct BlockInfo {
@@ -62,9 +68,9 @@ pub struct BlockInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precommits: Option<Vec<Signed<Precommit>>>,
 
-    /// Hashes of transactions in the block.
+    /// Info of transactions in the block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub txs: Option<Vec<Hash>>,
+    pub txs: Option<Vec<TxInfo>>,
 
     /// Median time from the block precommits.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,6 +170,13 @@ impl ExplorerApi {
         }
 
         let (upper, upper_bound) = if let Some(upper) = query.latest {
+            if upper > explorer.height() {
+                return Err(ApiError::NotFound(format!(
+                    "Requested latest height {} is greater than the current blockchain height {}",
+                    upper,
+                    explorer.height()
+                )));
+            }
             (upper, Bound::Included(upper))
         } else {
             (explorer.height(), Bound::Unbounded)
@@ -253,17 +266,20 @@ impl ExplorerApi {
         Ok(TransactionResponse { tx_hash })
     }
 
-    /// Subscribes to block commits events.
-    pub fn handle_subscribe(
+    /// Subscribes to events.
+    pub fn handle_ws<Q>(
         name: &'static str,
         backend: &mut actix_backend::ApiBuilder,
         service_api_state: ServiceApiState,
         shared_node_state: SharedNodeState,
-    ) {
+        extract_query: Q,
+    ) where
+        Q: Fn(&HttpRequest) -> Result<SubscriptionType, ActixError> + Send + Sync + 'static,
+    {
         let server = Arc::new(Mutex::new(None));
         let service_api_state = Arc::new(service_api_state);
 
-        let index = move |req: HttpRequest| -> FutureResponse {
+        let index = move |request: HttpRequest| -> FutureResponse {
             let server = server.clone();
             let service_api_state = service_api_state.clone();
             let mut address = server.lock().expect("Expected mutex lock");
@@ -272,8 +288,15 @@ impl ExplorerApi {
 
                 shared_node_state.set_broadcast_server_address(address.to_owned().unwrap());
             }
+            let address = address.to_owned().unwrap();
 
-            Box::new(ws::start(&req, Session::new(address.to_owned().unwrap())).into_future())
+            extract_query(&request)
+                .into_future()
+                .from_err()
+                .and_then(move |query: SubscriptionType| {
+                    ws::start(&request, Session::new(address, vec![query])).into_future()
+                })
+                .responder()
         };
 
         backend.raw_handler(RequestHandler {
@@ -289,11 +312,41 @@ impl ExplorerApi {
         service_api_state: ServiceApiState,
         shared_node_state: SharedNodeState,
     ) -> &mut ServiceApiScope {
-        Self::handle_subscribe(
+        // Default subscription for blocks.
+        Self::handle_ws(
             "v1/blocks/subscribe",
             api_scope.web_backend(),
-            service_api_state,
-            shared_node_state,
+            service_api_state.clone(),
+            shared_node_state.clone(),
+            |_| Ok(SubscriptionType::Blocks),
+        );
+        // Default subscription for transactions.
+        Self::handle_ws(
+            "v1/transactions/subscribe",
+            api_scope.web_backend(),
+            service_api_state.clone(),
+            shared_node_state.clone(),
+            |request| {
+                if request.query().is_empty() {
+                    return Ok(SubscriptionType::Transactions { filter: None });
+                }
+
+                Query::from_request(request, &Default::default())
+                    .map(|query: Query<TransactionFilter>| {
+                        Ok(SubscriptionType::Transactions {
+                            filter: Some(query.into_inner()),
+                        })
+                    })
+                    .unwrap_or(Ok(SubscriptionType::None))
+            },
+        );
+        // Default websocket connection.
+        Self::handle_ws(
+            "v1/ws",
+            api_scope.web_backend(),
+            service_api_state.clone(),
+            shared_node_state.clone(),
+            |_| Ok(SubscriptionType::None),
         );
         api_scope
             .endpoint("v1/blocks", Self::blocks)
@@ -305,21 +358,24 @@ impl ExplorerApi {
 
 impl<'a> From<explorer::BlockInfo<'a>> for BlockInfo {
     fn from(inner: explorer::BlockInfo<'a>) -> Self {
+        let txs = inner
+            .transaction_hashes()
+            .iter()
+            .enumerate()
+            .map(|(idx, hash)| {
+                let service_id = inner.transaction(idx).unwrap().content().service_id();
+                TxInfo {
+                    tx_hash: *hash,
+                    service_id,
+                }
+            })
+            .collect::<Vec<TxInfo>>();
+
         Self {
             block: inner.header().clone(),
             precommits: Some(inner.precommits().to_vec()),
-            txs: Some(inner.transaction_hashes().to_vec()),
+            txs: Some(txs),
             time: Some(median_precommits_time(&inner.precommits())),
         }
-    }
-}
-
-fn median_precommits_time(precommits: &[Signed<Precommit>]) -> DateTime<Utc> {
-    if precommits.is_empty() {
-        UNIX_EPOCH.into()
-    } else {
-        let mut times: Vec<_> = precommits.iter().map(|p| p.time()).collect();
-        times.sort();
-        times[times.len() / 2]
     }
 }

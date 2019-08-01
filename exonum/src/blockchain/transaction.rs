@@ -47,10 +47,10 @@ pub struct TransactionResult(pub Result<(), TransactionError>);
 /// and take some new transaction into pool from user input.
 #[derive(Serialize, Deserialize)]
 pub struct TransactionMessage {
+    service_id: u16,
     #[serde(skip_deserializing)]
     #[serde(rename = "debug")]
     transaction: Option<Box<dyn Transaction>>,
-
     #[serde(with = "HexStringRepresentation")]
     message: Signed<RawTransaction>,
 }
@@ -62,6 +62,7 @@ impl ::std::fmt::Debug for TransactionMessage {
             .write_hex(&mut signed_message_debug)?;
 
         let mut debug = fmt.debug_struct("TransactionMessage");
+        debug.field("service_id", &self.service_id);
         debug.field("message", &signed_message_debug);
         if let Some(ref tx) = self.transaction {
             debug.field("debug", tx);
@@ -88,12 +89,19 @@ impl TransactionMessage {
         use std::ops::Deref;
         self.transaction.as_ref().map(Deref::deref)
     }
+    /// Returns a service id of the transaction.
+    pub fn service_id(&self) -> u16 {
+        self.service_id
+    }
+
     /// Create new `TransactionMessage` from raw message.
     pub(crate) fn new(
         message: Signed<RawTransaction>,
         transaction: Box<dyn Transaction>,
     ) -> TransactionMessage {
+        let service_id = message.service_id();
         TransactionMessage {
+            service_id,
             transaction: Some(transaction),
             message,
         }
@@ -682,7 +690,7 @@ mod tests {
 
     fn create_blockchain() -> Blockchain {
         let service_keypair = crypto::gen_keypair();
-        let api_channel = mpsc::channel(1);
+        let api_channel = mpsc::unbounded();
         Blockchain::new(
             TemporaryDB::new(),
             vec![Box::new(TxResultService) as Box<dyn Service>],
