@@ -27,6 +27,8 @@ use std::{
 
 use exonum_merkledb::{HashTag, MapProof, ObjectHash, TemporaryDB};
 
+use crate::blockchain::check_tx;
+use crate::messages::PoolTransactionsRequest;
 use crate::{
     blockchain::{
         Block, BlockProof, Blockchain, ConsensusConfig, GenesisConfig, Schema, Service,
@@ -90,7 +92,7 @@ pub struct SandboxInner {
     pub timers: BinaryHeap<TimeoutRequest>,
     pub network_requests_rx: mpsc::Receiver<NetworkRequest>,
     pub internal_requests_rx: mpsc::Receiver<InternalRequest>,
-    pub api_requests_rx: mpsc::UnboundedReceiver<ExternalMessage>,
+    pub api_requests_rx: mpsc::Receiver<ExternalMessage>,
 }
 
 impl SandboxInner {
@@ -234,9 +236,14 @@ impl Sandbox {
         author: &PublicKey,
         height: Height,
         last_hash: &Hash,
+        pool_size: u64,
         secret_key: &SecretKey,
     ) -> Signed<Status> {
-        Message::concrete(Status::new(height, last_hash), *author, secret_key)
+        Message::concrete(
+            Status::new(height, last_hash, pool_size),
+            *author,
+            secret_key,
+        )
     }
 
     /// Creates a `BlockResponse` message signed by this validator.
@@ -285,6 +292,16 @@ impl Sandbox {
         secret_key: &SecretKey,
     ) -> Signed<PeersRequest> {
         Message::concrete(PeersRequest::new(to), *public_key, secret_key)
+    }
+
+    /// Creates a `PoolTransactionsRequest` message signed by this validator.
+    pub fn create_pool_transactions_request(
+        &self,
+        public_key: &PublicKey,
+        to: PublicKey,
+        secret_key: &SecretKey,
+    ) -> Signed<PoolTransactionsRequest> {
+        Message::concrete(PoolTransactionsRequest::new(to), *public_key, secret_key)
     }
 
     /// Creates a `Propose` message signed by this validator.
@@ -507,7 +524,7 @@ impl Sandbox {
 
             let id = self.addresses.iter().position(|ref a| a.public_key == addr);
             if let Some(id) = id {
-                assert_eq!(&self.public_key(ValidatorId(id as u16)), peers_request.to());
+                assert_eq!(&self.public_key(ValidatorId(id as u16)), &peers_request.to);
             } else {
                 panic!("Sending PeersRequest to unknown peer {:?}", addr);
             }
@@ -539,7 +556,7 @@ impl Sandbox {
     where
         I: IntoIterator<Item = &'a PublicKey>,
     {
-        let expected_msg = msg.signed_message();
+        let expected_msg = Message::deserialize(msg.signed_message().clone()).unwrap();
 
         // If node is excluded from validators, then it still will broadcast messages.
         // So in that case we should not skip addresses and validators count.
@@ -547,9 +564,9 @@ impl Sandbox {
 
         for _ in 0..expected_set.len() {
             if let Some((real_addr, real_msg)) = self.pop_sent_message() {
+                let real_msg = Message::deserialize(real_msg.signed_message().clone()).unwrap();
                 assert_eq!(
-                    expected_msg,
-                    real_msg.signed_message(),
+                    expected_msg, real_msg,
                     "Expected to broadcast other message"
                 );
                 if !expected_set.contains(&real_addr) {
@@ -576,6 +593,7 @@ impl Sandbox {
             &self.node_public_key(),
             height,
             block_hash,
+            0,
             &self.node_secret_key(),
         ));
     }
@@ -642,7 +660,11 @@ impl Sandbox {
                     return false;
                 }
                 unique_set.insert(hash_elem);
-                if schema_transactions.contains(&hash_elem) {
+                if check_tx(
+                    &hash_elem,
+                    &schema_transactions,
+                    self.node_state().tx_cache(),
+                ) {
                     return false;
                 }
                 true
@@ -680,7 +702,8 @@ impl Sandbox {
 
         let fork = {
             let mut fork = blockchain.fork();
-            let (_, patch) = blockchain.create_patch(ValidatorId(0), height, &hashes);
+            let (_, patch) =
+                blockchain.create_patch(ValidatorId(0), height, &hashes, &mut BTreeMap::new());
             fork.merge(patch);
             fork
         };
@@ -745,7 +768,9 @@ impl Sandbox {
         let snapshot = self.blockchain_ref().snapshot();
         let schema = Schema::new(&snapshot);
         let idx = schema.transactions_pool();
-        let vec = idx.iter().collect();
+
+        let mut vec: Vec<Hash> = idx.iter().collect();
+        vec.extend(self.node_state().tx_cache().keys().cloned());
         vec
     }
 
@@ -780,6 +805,10 @@ impl Sandbox {
         let view = self.blockchain_ref().snapshot();
         let schema = Schema::new(&view);
         assert_eq!(expected, schema.transactions_pool_len());
+    }
+
+    pub fn assert_tx_cache_len(&self, expected: u64) {
+        assert_eq!(expected, self.node_state().tx_cache_len() as u64);
     }
 
     pub fn assert_lock(&self, expected_round: Round, expected_hash: Option<Hash>) {
@@ -826,7 +855,7 @@ impl Sandbox {
     pub fn restart_uninitialized_with_time(self, time: SystemTime) -> Sandbox {
         let network_channel = mpsc::channel(100);
         let internal_channel = mpsc::channel(100);
-        let api_channel = mpsc::unbounded();
+        let api_channel = mpsc::channel(100);
 
         let address: SocketAddr = self
             .address(ValidatorId(0))
@@ -1057,7 +1086,7 @@ fn sandbox_with_services_uninitialized(
         })
         .collect();
 
-    let api_channel = mpsc::unbounded();
+    let api_channel = mpsc::channel(100);
     let db = TemporaryDB::new();
     let mut blockchain = Blockchain::new(
         db,

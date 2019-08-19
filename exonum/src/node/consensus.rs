@@ -14,13 +14,13 @@
 
 use std::collections::HashSet;
 
-use crate::blockchain::Schema;
+use crate::blockchain::{check_tx, Schema};
 use crate::crypto::{CryptoHash, Hash, PublicKey};
 use crate::events::InternalRequest;
 use crate::helpers::{Height, Round, ValidatorId};
 use crate::messages::{
-    BlockRequest, BlockResponse, Consensus as ConsensusMessage, Precommit, Prevote,
-    PrevotesRequest, Propose, ProposeRequest, RawTransaction, Signed, SignedMessage,
+    BlockRequest, BlockResponse, Consensus as ConsensusMessage, PoolTransactionsRequest, Precommit,
+    Prevote, PrevotesRequest, Propose, ProposeRequest, RawTransaction, Signed, SignedMessage,
     TransactionsRequest, TransactionsResponse,
 };
 use crate::node::{NodeHandler, RequestData};
@@ -122,7 +122,7 @@ impl NodeHandler {
         ) {
             Ok(state) => state.has_unknown_txs(),
             Err(err) => {
-                warn!("{}, msg={:?}", err, msg);
+                warn!("{} from {:?}", err, msg.validator());
                 return;
             }
         };
@@ -477,11 +477,22 @@ impl NodeHandler {
 
         // Merge changes into storage
         let (committed_txs, proposer) = {
-            // FIXME: Avoid of clone here. (ECR-171)
-            let block_state = self.state.block(&block_hash).unwrap().clone();
-            self.blockchain
-                .commit(block_state.patch(), block_hash, precommits)
-                .unwrap();
+            let (committed_txs, proposer) = {
+                let block_state = self.state.block_mut(&block_hash).unwrap();
+                let committed_txs = block_state.txs().len();
+                let proposer = block_state.proposer_id();
+
+                self.blockchain
+                    .commit(
+                        block_state.patch(),
+                        block_hash,
+                        precommits,
+                        self.state.tx_cache_mut(),
+                    )
+                    .unwrap();
+
+                (committed_txs, proposer)
+            };
             // Update node state.
             self.state
                 .update_config(Schema::new(&self.blockchain.snapshot()).actual_configuration());
@@ -489,7 +500,7 @@ impl NodeHandler {
             let block_hash = self.blockchain.last_hash();
             self.state
                 .new_height(&block_hash, self.system_state.current_time());
-            (block_state.txs().len(), block_state.proposer_id())
+            (committed_txs, proposer)
         };
 
         self.api_state.broadcast(&block_hash);
@@ -533,7 +544,9 @@ impl NodeHandler {
         let hash = msg.hash();
 
         let snapshot = self.blockchain.snapshot();
-        if Schema::new(&snapshot).transactions().contains(&hash) {
+        let schema = Schema::new(&snapshot);
+
+        if check_tx(&hash, &schema.transactions(), self.state.tx_cache()) {
             bail!("Received already processed transaction, hash {:?}", hash)
         }
 
@@ -542,14 +555,7 @@ impl NodeHandler {
             bail!("Received malicious transaction.")
         }
 
-        let fork = self.blockchain.fork();
-        {
-            let mut schema = Schema::new(&fork);
-            schema.add_transaction_into_pool(msg);
-        }
-        self.blockchain
-            .merge(fork.into_patch())
-            .expect("Unable to save transaction to persistent pool.");
+        self.state.tx_cache_mut().insert(hash, msg);
 
         if self.state.is_leader() && self.state.round() != Round::zero() {
             self.maybe_add_propose_timeout();
@@ -682,17 +688,10 @@ impl NodeHandler {
             if self.state.have_prevote(round) {
                 return;
             }
-            let snapshot = self.blockchain.snapshot();
-            let schema = Schema::new(&snapshot);
-            let pool = schema.transactions_pool();
-            let pool_len = schema.transactions_pool_len();
-
-            info!("LEADER: pool = {}", pool_len);
-
             let round = self.state.round();
-            let max_count = ::std::cmp::min(u64::from(self.txs_block_limit()), pool_len);
 
-            let txs: Vec<Hash> = pool.iter().take(max_count as usize).collect();
+            let txs = self.get_txs_for_propose();
+
             let propose = self.sign_message(Propose::new(
                 validator_id,
                 self.state.height(),
@@ -700,6 +699,7 @@ impl NodeHandler {
                 self.state.last_hash(),
                 &txs,
             ));
+
             // Put our propose to the consensus messages cache
             self.blockchain.save_message(round, propose.clone());
 
@@ -717,6 +717,33 @@ impl NodeHandler {
                 self.handle_majority_prevotes(round, &hash);
             }
         }
+    }
+
+    fn get_txs_for_propose(&self) -> Vec<Hash> {
+        let txs_cache_len = self.state.tx_cache_len() as u64;
+        let tx_block_limit = self.txs_block_limit();
+
+        let snapshot = self.blockchain.snapshot();
+        let schema = Schema::new(&snapshot);
+        let pool = schema.transactions_pool();
+        let pool_len = schema.transactions_pool_len();
+
+        info!("LEADER: pool = {}, cache = {}", pool_len, txs_cache_len);
+
+        let remaining_tx_count = tx_block_limit.saturating_sub(txs_cache_len as u32);
+        let cache_max_count = ::std::cmp::min(u64::from(tx_block_limit), txs_cache_len);
+
+        let mut cache_txs: Vec<Hash> = self
+            .state
+            .tx_cache()
+            .keys()
+            .take(cache_max_count as usize)
+            .cloned()
+            .collect();
+        let pool_txs: Vec<Hash> = pool.iter().take(remaining_tx_count as usize).collect();
+
+        cache_txs.extend(pool_txs);
+        cache_txs
     }
 
     /// Handles request timeout by sending the corresponding request message to a peer.
@@ -745,6 +772,9 @@ impl NodeHandler {
                         .collect();
                     self.sign_message(TransactionsRequest::new(&peer, &txs))
                         .into()
+                }
+                RequestData::PoolTransactions => {
+                    self.sign_message(PoolTransactionsRequest::new(peer)).into()
                 }
                 RequestData::BlockTransactions => {
                     let txs: Vec<_> = match self.state.incomplete_block() {
@@ -781,7 +811,12 @@ impl NodeHandler {
         height: Height,
         tx_hashes: &[Hash],
     ) -> (Hash, Patch) {
-        self.blockchain.create_patch(proposer_id, height, tx_hashes)
+        self.blockchain.create_patch(
+            proposer_id,
+            height,
+            tx_hashes,
+            &mut self.state.tx_cache_mut(),
+        )
     }
 
     /// Calls `create_block` with transactions from the corresponding `Propose` and returns the
