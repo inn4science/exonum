@@ -14,7 +14,7 @@
 
 //! This module implements node maintenance actions.
 
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::{Path, PathBuf}, str::FromStr};
 
 use super::{
     internal::{CollectedCommand, Command, Feedback},
@@ -24,6 +24,7 @@ use crate::blockchain::Schema;
 use crate::helpers::config::ConfigFile;
 use crate::node::NodeConfig;
 use exonum_merkledb::{Database, DbOptions, RocksDB};
+use crate::helpers::fabric::password::{PassInputMethod, SecretKeyType};
 
 // Context entry for the path to the node config.
 const NODE_CONFIG_PATH: &str = "NODE_CONFIG_PATH";
@@ -31,6 +32,10 @@ const NODE_CONFIG_PATH: &str = "NODE_CONFIG_PATH";
 const DATABASE_PATH: &str = "DATABASE_PATH";
 // Context entry for the type of action to be performed.
 const MAINTENANCE_ACTION_PATH: &str = "MAINTENANCE_ACTION_PATH";
+
+const CONSENSUS_KEY_PASS_METHOD: &str = "CONSENSUS_KEY_PASS_METHOD";
+
+const SERVICE_KEY_PASS_METHOD: &str = "SERVICE_KEY_PASS_METHOD";
 
 /// Maintenance command. Supported actions:
 ///
@@ -43,7 +48,33 @@ impl Maintenance {
         let path = ctx
             .arg::<String>(NODE_CONFIG_PATH)
             .unwrap_or_else(|_| panic!("{} not found.", NODE_CONFIG_PATH));
-        ConfigFile::load(path).expect("Can't load node config file")
+        let run_config: NodeConfig<PathBuf> = ConfigFile::load(path.clone()).expect("Can't load node config file");
+
+        let consensus_passphrase = {
+            let consensus_pass_method = ctx
+                .arg::<String>(CONSENSUS_KEY_PASS_METHOD)
+                .unwrap_or_else(|_| panic!("{} not found.", NODE_CONFIG_PATH));
+
+            PassInputMethod::from_str(&consensus_pass_method)
+                .expect("Incorrect passphrase input method for consensus key.")
+                .get_passphrase(SecretKeyType::Consensus, true)
+        };
+
+        let service_passphrase = {
+            let service_pass_method = ctx
+                .arg::<String>(SERVICE_KEY_PASS_METHOD)
+                .unwrap_or_else(|_| panic!("{} not found.", NODE_CONFIG_PATH));
+
+            PassInputMethod::from_str(&service_pass_method)
+                .expect("Incorrect passphrase input method for service key.")
+                .get_passphrase(SecretKeyType::Service, true)
+        };
+
+        run_config.read_secret_keys(
+            &path,
+            consensus_passphrase.as_bytes(),
+            service_passphrase.as_bytes(),
+        )
     }
 
     fn database(ctx: &Context, options: &DbOptions) -> Box<dyn Database> {
@@ -91,6 +122,26 @@ impl Command for Maintenance {
                 "Action to be performed during maintenance.",
                 "a",
                 "action",
+                false,
+            ),
+            Argument::new_named(
+                CONSENSUS_KEY_PASS_METHOD,
+                false,
+                "Passphrase entry method for consensus key.\n\
+                 Possible values are: stdin, env{:ENV_VAR_NAME}, pass:PASSWORD (default: stdin)\n\
+                 If ENV_VAR_NAME is not specified $EXONUM_CONSENSUS_PASS is used",
+                None,
+                "consensus-key-pass",
+                false,
+            ),
+            Argument::new_named(
+                SERVICE_KEY_PASS_METHOD,
+                false,
+                "Passphrase entry method for service key.\n\
+                 Possible values are: stdin, env{:ENV_VAR_NAME}, pass:PASSWORD (default: stdin)\n\
+                 If ENV_VAR_NAME is not specified $EXONUM_SERVICE_PASS is used",
+                None,
+                "service-key-pass",
                 false,
             ),
         ]
