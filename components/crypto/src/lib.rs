@@ -56,8 +56,8 @@ use self::crypto_lib::sodiumoxide as crypto_impl;
 #[macro_use]
 mod macros;
 
-pub(crate) mod crypto_lib;
-pub(crate) mod utils;
+pub mod crypto_lib;
+pub mod utils;
 
 /// The size to crop the string in debug messages.
 const BYTES_IN_DEBUG: usize = 4;

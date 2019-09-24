@@ -87,14 +87,14 @@ impl Hex<PublicKey> for PublicKeyHex {
 }
 
 #[derive(Serialize, Deserialize)]
-struct EncryptedKeys {
+pub struct EncryptedKeys {
     #[serde(with = "PublicKeyHex")]
     public_key: PublicKey,
     secret_key: ErasedPwBox,
 }
 
 impl EncryptedKeys {
-    fn encrypt(
+    pub fn encrypt(
         public_key: PublicKey,
         secret_key: &SecretKey,
         pass_phrase: impl AsRef<[u8]>,
@@ -116,7 +116,7 @@ impl EncryptedKeys {
         })
     }
 
-    fn decrypt(self, pass_phrase: impl AsRef<[u8]>) -> Result<(PublicKey, SecretKey), Error> {
+    pub fn decrypt(self, pass_phrase: impl AsRef<[u8]>) -> Result<(PublicKey, SecretKey), Error> {
         let mut eraser = Eraser::new();
         eraser.add_suite::<Sodium>();
         let restored = eraser
