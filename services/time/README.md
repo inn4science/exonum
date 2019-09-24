@@ -16,7 +16,7 @@ Include `exonum-time` as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-exonum = "0.12.0"
+exonum = "0.12.1"
 exonum-time = "0.12.0"
 ```
 
